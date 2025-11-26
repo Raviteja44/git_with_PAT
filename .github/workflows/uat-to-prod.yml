@@ -1,0 +1,197 @@
+name: 3. Promote UAT → PROD
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number that was merged into uat"
+        required: true
+        type: number
+      source_branch:
+        description: "Select source branch (must be uat)"
+        required: true
+        type: choice
+        options:
+          - uat
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Git and tools
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR exists, is merged, and targeted uat
+        id: validate
+        run: |
+          PR="${{ github.event.inputs.pr_number }}"
+
+          if [ -z "$PR" ]; then
+            echo "Error: PR number cannot be empty." >&2
+            exit 1
+          fi
+
+          PR_JSON=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}")
+
+          ERR=$(echo "$PR_JSON" | jq -r '.message // empty')
+          if [ -n "$ERR" ]; then
+            echo "Error: PR #$PR not found. API message: $ERR" >&2
+            exit 1
+          fi
+
+          BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
+          MERGED=$(echo "$PR_JSON" | jq -r '.merged')
+
+          if [ "$MERGED" != "true" ]; then
+            echo "Error: PR #$PR is not merged." >&2
+            exit 1
+          fi
+
+          if [ "$BASE_BRANCH" != "uat" ]; then
+            echo "Error: PR #$PR was not merged into uat (found: $BASE_BRANCH)." >&2
+            exit 1
+          fi
+
+          LAST_SHA=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/commits" \
+            | jq -r '.[-1].sha')
+
+          echo "pr_number=$PR" >> $GITHUB_OUTPUT
+          echo "pr_last_sha=$LAST_SHA" >> $GITHUB_OUTPUT
+
+      - name: Download PR diff
+        run: |
+          PR="${{ steps.validate.outputs.pr_number }}"
+          curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}" \
+            > pr.diff
+
+          if [ ! -s pr.diff ]; then
+            echo "Error: PR #$PR diff is empty." >&2
+            exit 1
+          fi
+
+      - name: Create temporary promote branch from prod
+        id: create_branch
+        run: |
+          PR="${{ steps.validate.outputs.pr_number }}"
+          TS=$(date +%s)
+          BRANCH="promote/uat-to-prod-${TS}-pr${PR}"
+
+          git fetch origin prod:refs/remotes/origin/prod || true
+          git checkout -b "$BRANCH" origin/prod
+
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Apply PR diff and push
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+
+          if ! git apply --index pr.diff; then
+            echo "Error: PR diff could not be applied cleanly onto prod." >&2
+            exit 1
+          fi
+
+          git commit -m "Promote PR #${{ steps.validate.outputs.pr_number }} changes to prod"
+          git push origin "HEAD:$BR"
+
+      - name: Build PR body content
+        id: body
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+          PR="${{ steps.validate.outputs.pr_number }}"
+
+          FILES=$(git --no-pager diff --name-only origin/prod..origin/"$BR")
+          FILE_COUNT=$(echo "$FILES" | sed '/^\s*$/d' | wc -l | tr -d ' ')
+
+          COMMITS=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}/commits" \
+            | jq -r '.[] | "- " + (.commit.message | split("\n")[0]) + " (" + (.sha[0:7]) + ")"')
+
+          echo "Automated Promotion PR" > body.txt
+          echo "" >> body.txt
+          echo "Source PR: #$PR (merged into uat)" >> body.txt
+          echo "Target branch: prod" >> body.txt
+          echo "" >> body.txt
+          echo "Changes identified: $FILE_COUNT files" >> body.txt
+          echo "" >> body.txt
+          echo "Changed files:" >> body.txt
+          echo "$FILES" >> body.txt
+          echo "" >> body.txt
+          echo "Commit messages:" >> body.txt
+          echo "$COMMITS" >> body.txt
+          echo "" >> body.txt
+          echo "A PR ID reference will be added below for future reference." >> body.txt
+
+      - name: Create PR into prod
+        id: create_pr
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+          PR="${{ steps.validate.outputs.pr_number }}"
+          TITLE="Promote uat → prod (PR #${PR})"
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg head "$BR" \
+            --arg base "prod" \
+            --arg body "$(cat body.txt)" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+
+          echo "$RESPONSE" > created.json
+
+          PR_NUM=$(jq -r '.number' created.json)
+          if [ "$PR_NUM" = "null" ]; then
+            echo "Error: Failed to create PR. $(jq -r '.message' created.json)" >&2
+            exit 1
+          fi
+
+          echo "created_pr=$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Update PR body with PR ID
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+          UPDATED=updated_body.txt
+
+          cat body.txt > "$UPDATED"
+          echo "" >> "$UPDATED"
+          echo "PR ID: $PR" >> "$UPDATED"
+          echo "Retain this PR ID as reference for exact changes promoted to prod." >> "$UPDATED"
+
+          PAYLOAD=$(jq -n --arg body "$(cat $UPDATED)" '{body:$body}')
+
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}" > /dev/null
+
+      - name: Completed
+        run: |
+          echo "Promotion UAT → PROD completed successfully."

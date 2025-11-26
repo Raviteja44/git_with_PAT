@@ -1,0 +1,127 @@
+name: 1. Promote Feature to Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      feature_branch:
+        description: "Feature branch name (example: feature/edp_changes_JIRA-123)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Git Identity
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Checkout dev branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: dev
+
+      - name: Fetch feature branch
+        run: |
+          git fetch origin ${{ github.event.inputs.feature_branch }}
+
+      - name: Check for differences
+        id: diffcheck
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+
+          if git diff --quiet origin/dev origin/$FEATURE; then
+            echo "has_diff=false" >> $GITHUB_ENV
+          else
+            echo "has_diff=true" >> $GITHUB_ENV
+          fi
+
+      - name: Stop workflow if no differences
+        if: env.has_diff == 'false'
+        run: |
+          echo "No differences detected. PR not created."
+          exit 1
+
+      - name: Prepare PR Content
+        id: prepare
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+
+          FILES=$(git diff --name-only origin/dev origin/$FEATURE)
+          FILE_COUNT=$(echo "$FILES" | wc -l || true)
+
+          COMMITS=$(git log origin/dev..origin/$FEATURE --pretty=format:"- %s (%h)" || true)
+
+          echo "FILES<<EOF" >> $GITHUB_ENV
+          echo "$FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          echo "COMMITS<<EOF" >> $GITHUB_ENV
+          echo "$COMMITS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create Pull Request (using PAT)
+        id: create_pr
+        run: |
+          FEATURE="${{ github.event.inputs.feature_branch }}"
+          TITLE="Promote ${FEATURE} to dev"
+          BODY_FILE="body.txt"
+
+          echo "Automated Promotion PR" > $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "Source branch: ${FEATURE}" >> $BODY_FILE
+          echo "Target branch: dev" >> $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "Changed Files:" >> $BODY_FILE
+          echo "${FILES}" >> $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "Commit Messages:" >> $BODY_FILE
+          echo "${COMMITS}" >> $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "A PR ID reference will be added automatically below." >> $BODY_FILE
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg head "$FEATURE" \
+            --arg base "dev" \
+            --arg body "$(cat body.txt)" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+
+          echo "$RESPONSE" > pr_response.json
+          PR_NUMBER=$(jq '.number' pr_response.json)
+
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_ENV
+          echo "Created PR #$PR_NUMBER"
+
+      - name: Update PR Body With PR ID (using PAT)
+        run: |
+          PR_NUM="${{ env.pr_number }}"
+          BODY_FILE="updated_body.txt"
+
+          echo "$(cat body.txt)" > $BODY_FILE
+          echo "" >> $BODY_FILE
+          echo "PR ID: ${PR_NUM}" >> $BODY_FILE
+          echo "Make note of this ID if these changes need to be promoted from dev to uat later." >> $BODY_FILE
+
+          PAYLOAD=$(jq -n \
+            --arg body "$(cat updated_body.txt)" \
+            '{body:$body}')
+
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ env.pr_number }}"
